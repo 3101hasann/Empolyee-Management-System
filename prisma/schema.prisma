@@ -1,0 +1,246 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "mysql"
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+// Extended via migration when HR / Manager / future roles arrive.
+enum UserRole {
+  ADMIN
+}
+
+enum Gender {
+  MALE
+  FEMALE
+  OTHER
+}
+
+enum BatchStatus {
+  UPCOMING
+  ACTIVE
+  CLOSED
+}
+
+enum ChatRole {
+  USER
+  ASSISTANT
+}
+
+// ---------------------------------------------------------------------------
+// Auth
+// ---------------------------------------------------------------------------
+
+// Pure credential record: what secret unlocks the account, what it may do,
+// and whether it is enabled. ALL identity (name, email, phone, …) lives on
+// the required linked Person — the admin has a Person row too. Login
+// resolves the email through the person relation. Granting an internee or
+// employee portal access later = create a User pointing at their existing
+// Person with the appropriate role. Keep credential fields here, never on
+// Person: UI queries include Person freely and must never see a hash.
+model User {
+  id           Int      @id @default(autoincrement())
+  passwordHash String
+  role         UserRole
+  isActive     Boolean  @default(true)
+  personId     Int      @unique
+  person       Person   @relation(fields: [personId], references: [id], onDelete: Restrict)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@map("users")
+}
+
+// ---------------------------------------------------------------------------
+// Workforce core
+// ---------------------------------------------------------------------------
+
+// Identity only. Every future workforce type (Employee, Contractor, ...)
+// attaches to Person as a sibling profile of Internee.
+model Person {
+  id               Int       @id @default(autoincrement())
+  firstName        String    @db.VarChar(100)
+  lastName         String    @db.VarChar(100)
+  email            String    @unique
+  // Nullable at the DB level so system humans (admin) don't need them;
+  // internee flows still require both via the Zod schemas.
+  phone            String?   @db.VarChar(20)
+  gender           Gender?
+  cityId           Int?
+  city             City?     @relation(fields: [cityId], references: [id], onDelete: Restrict)
+  profileImagePath String?
+  cvFilePath       String?
+  deletedAt        DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  internee Internee?
+  user     User?
+
+  @@index([deletedAt])
+  @@index([cityId])
+  @@map("persons")
+}
+
+model City {
+  id        Int      @id @default(autoincrement())
+  name      String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  persons Person[]
+
+  @@map("cities")
+}
+
+// Intern-specific profile (wizard step 1).
+model Internee {
+  id            Int       @id @default(autoincrement())
+  personId      Int       @unique
+  person        Person    @relation(fields: [personId], references: [id], onDelete: Restrict)
+  fatherName    String?   @db.VarChar(100)
+  guardianPhone String?   @db.VarChar(20)
+  referredBy    String?   @db.VarChar(100)
+  deletedAt     DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  tenures Tenure[]
+
+  @@map("internees")
+}
+
+// ---------------------------------------------------------------------------
+// Batches
+// ---------------------------------------------------------------------------
+
+model Batch {
+  id           Int         @id @default(autoincrement())
+  name         String      @db.VarChar(100)
+  status       BatchStatus @default(UPCOMING)
+  startDate    DateTime    @db.Date
+  endDate      DateTime    @db.Date
+  // Minutes since midnight (540 = 09:00). Timezone-proof and sortable.
+  startTimeMin Int         @db.SmallInt
+  endTimeMin   Int         @db.SmallInt
+  // Bitmask: MON=1 TUE=2 WED=4 THU=8 FRI=16 SAT=32 SUN=64 (see lib/utils/weekdays).
+  daysOfWeek   Int         @db.UnsignedTinyInt
+  roadmap      String?     @db.Text
+  comments     String?     @db.Text
+  deletedAt    DateTime?
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+
+  tenures Tenure[]
+
+  @@index([status, deletedAt])
+  @@map("batches")
+}
+
+// ---------------------------------------------------------------------------
+// Lookups (admin-managed; no soft delete — deletion is Restrict-blocked
+// while referenced)
+// ---------------------------------------------------------------------------
+
+model Institute {
+  id        Int      @id @default(autoincrement())
+  name      String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenures Tenure[]
+
+  @@map("institutes")
+}
+
+model Degree {
+  id        Int      @id @default(autoincrement())
+  name      String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenures Tenure[]
+
+  @@map("degrees")
+}
+
+// ---------------------------------------------------------------------------
+// Assistant chatbot
+// ---------------------------------------------------------------------------
+
+// One admin chat thread. Kept forever (soft delete) — the message log doubles
+// as an audit trail of what the assistant was asked and what it ran.
+model Conversation {
+  id        Int       @id @default(autoincrement())
+  title     String    @db.VarChar(120)
+  userId    Int
+  deletedAt DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  messages ChatMessage[]
+
+  @@index([userId, deletedAt, updatedAt])
+  @@map("assistant_conversations")
+}
+
+model ChatMessage {
+  id             Int          @id @default(autoincrement())
+  conversationId Int
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  role           ChatRole
+  content        String       @db.Text
+  // Tool-call trace: [{name, arguments, rowCount?}, ...] — powers the
+  // "view query" UI and audits every SQL the assistant executed.
+  toolCalls      Json?
+  createdAt      DateTime     @default(now())
+
+  @@index([conversationId])
+  @@map("assistant_messages")
+}
+
+// ---------------------------------------------------------------------------
+// Tenures
+// ---------------------------------------------------------------------------
+
+// One engagement of an internee in a batch (wizard step 2).
+// Repeat internships = multiple rows across different batches.
+model Tenure {
+  id              Int        @id @default(autoincrement())
+  interneeId      Int
+  internee        Internee   @relation(fields: [interneeId], references: [id], onDelete: Restrict)
+  batchId         Int
+  batch           Batch      @relation(fields: [batchId], references: [id], onDelete: Restrict)
+  startDate       DateTime   @db.Date
+  endDate         DateTime   @db.Date
+  instituteId     Int?
+  institute       Institute? @relation(fields: [instituteId], references: [id], onDelete: Restrict)
+  degreeId        Int?
+  degree          Degree?    @relation(fields: [degreeId], references: [id], onDelete: Restrict)
+  degreeStartDate DateTime?  @db.Date
+  degreeEndDate   DateTime?  @db.Date
+  semester        Int?       @db.TinyInt
+  grade           String?    @db.VarChar(5)
+  skills          String?    @db.Text
+  miscCourses     String?    @db.Text
+  skillsLearned   String?    @db.Text
+  certStartDate   DateTime?  @db.Date
+  certEndDate     DateTime?  @db.Date
+  certIssueDate   DateTime?  @db.Date
+  score           Decimal?   @db.Decimal(5, 2)
+  certFilePath    String?
+  comments        String?    @db.Text
+  deletedAt       DateTime?
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+
+  @@unique([interneeId, batchId])
+  @@index([batchId])
+  @@map("tenures")
+}
